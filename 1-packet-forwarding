@@ -1,0 +1,567 @@
+# ENCOR 350-401 — Chapitre 1 : Packet Forwarding
+
+> Fiche de révision : tout le chapitre, réexpliqué simplement.
+> Plan : **L2 (switch)** → **VLAN / ports** → **L3 (routage)** → **Architectures de forwarding (CEF, CAM, TCAM, SDM)**
+
+---
+
+## 0. L'idée générale du chapitre
+
+Un équipement réseau reçoit un paquet et doit répondre à une seule question : **par où je le renvoie ?**
+
+- Un **switch** répond en regardant la **MAC destination** (L2).
+- Un **routeur** répond en regardant l'**IP destination** (L3).
+- Un **switch multilayer (MLS)** sait faire les deux, en hardware (ASIC).
+
+Rappel du modèle OSI, du point de vue du chapitre :
+
+| Couche | Nom | Ce qui compte ici |
+|---|---|---|
+| 7 → 4 | Application → Transport | les données, pas notre sujet |
+| **3** | Network | **adresse IP**, routage |
+| **2** | Data Link | **adresse MAC**, switching |
+| 1 | Physical | câble, fibre, radio |
+
+L'émetteur descend les couches (encapsulation), le récepteur les remonte.
+
+---
+
+## 1. Forwarding L2 (le switch)
+
+### 1.1 L'adresse MAC
+
+- **48 bits**, écrite en **hexadécimal**, sur 6 octets.
+- 3 premiers octets = **OUI** (identifie le constructeur).
+- 3 derniers octets = numéro unique attribué par le constructeur.
+- Une carte réseau ne remonte une trame en L3 que si la MAC destination est **la sienne**.
+- Exception : le **broadcast** `FF:FF:FF:FF:FF:FF`, traité par tout le monde dans le segment. Il **ne traverse pas** un routeur.
+
+### 1.2 Domaine de collision
+
+**Le problème** : Ethernet était à l'origine un média partagé. Si deux machines parlent en même temps → collision.
+
+**La solution historique** : **CSMA/CD**. On écoute le câble, on attend qu'il soit libre, puis on parle. Conséquence : **half-duplex** (soit j'émets, soit je reçois).
+
+- **Domaine de collision** = zone où une machine « entend » quand une autre émet.
+- **Hub** : répète tout sur tous les ports → **un seul gros domaine de collision**. Plus on ajoute de ports, pire c'est.
+- **Switch** : envoie la trame **uniquement vers le bon port** grâce à sa table MAC → **chaque port = son propre domaine de collision** → **full-duplex** possible.
+
+```
+HUB :    [ PC-A  PC-B  PC-C ]       ← tout le monde dans 1 domaine
+SWITCH : [PC-A] [PC-B] [PC-C]       ← 1 domaine par port
+```
+
+### 1.3 Comment le switch forwarde
+
+| Situation | Ce que fait le switch |
+|---|---|
+| MAC destination **connue** dans la table | envoie **uniquement** sur le port associé |
+| MAC destination **inconnue** | **unknown unicast flooding** : envoie sur tous les ports sauf celui d'arrivée |
+| **Broadcast** | envoie sur tous les ports (du VLAN) |
+
+### 1.4 Domaine de broadcast
+
+- **Domaine de broadcast** = ensemble des machines qui reçoivent un broadcast = un **segment L2** = un **VLAN**.
+- Un **switch** réduit les domaines de **collision**.
+- Un **routeur** réduit les domaines de **broadcast**.
+
+> 🎯 Classique d'examen : switch → collision / routeur → broadcast.
+
+---
+
+## 2. VLAN
+
+### 2.1 Pourquoi
+
+Sans VLAN, 1 switch = 1 domaine de broadcast. Les **VLAN** créent **plusieurs domaines de broadcast sur un même switch** → segmentation logique, meilleure utilisation des ports.
+
+Deux machines dans des VLAN différents **ne peuvent pas communiquer sans routeur** (ou switch L3).
+
+### 2.2 Le tag 802.1Q
+
+Standard **IEEE 802.1Q** : on insère **32 bits (4 octets)** dans l'en-tête Ethernet, entre la MAC source et la suite.
+
+```
+| MAC dst | MAC src | TPID | PCP | DEI | VLAN ID | IP src | IP dst | Payload |
+                    \________ tag 802.1Q (32 bits) ________/
+```
+
+| Champ | Taille | Rôle |
+|---|---|---|
+| **TPID** | 16 bits | vaut **0x8100** → « cette trame est taggée 802.1Q » |
+| **PCP** | 3 bits | priorité **CoS** (0 à 7) → QoS L2 entre switches |
+| **DEI** | 1 bit | « cette trame peut être droppée » en cas de congestion |
+| **VLAN ID** | 12 bits | numéro de VLAN → **4094 VLAN utilisables** |
+
+> Le tag n'est **pas** ajouté pour le trafic local au switch : il n'apparaît que sur les **trunks**.
+
+### 2.3 Plages de VLAN (Catalyst)
+
+| VLAN | Statut |
+|---|---|
+| **0** | réservé (trafic 802.1p), non modifiable |
+| **1** | VLAN par défaut, ni modifiable ni supprimable |
+| **2 – 1001** | plage **normale** |
+| **1002 – 1005** | réservés (FDDI / Token Ring historiques), non supprimables |
+| **1006 – 4094** | plage **étendue** |
+
+### 2.4 Configuration
+
+```
+SW1(config)# vlan 10
+SW1(config-vlan)# name PCs
+SW1(config-vlan)# vlan 20
+SW1(config-vlan)# name Phones
+```
+
+- Le nom fait max **32 caractères**.
+- ⚠️ Le VLAN n'est **réellement créé** qu'en quittant le sous-mode (retour en global ou passage à un autre `vlan X`).
+
+### 2.5 Vérification : `show vlan`
+
+`show vlan` affiche 4 blocs : ports par VLAN, MTU, VLAN RSPAN, private VLAN.
+
+| Option | Utilité |
+|---|---|
+| `brief` | juste la correspondance VLAN ↔ ports |
+| `summary` | nombre de VLAN (total, VTP, étendus) |
+| `id <vlan>` | filtre sur un numéro |
+| `name <nom>` | filtre sur un nom (même sortie que `id`) |
+
+---
+
+## 3. Types de ports
+
+### 3.1 Access port
+
+- Appartient à **un seul VLAN**.
+- Trafic **jamais taggé** (ni en entrée ni en sortie).
+- Par défaut, un port Catalyst est access dans le **VLAN 1**.
+
+```
+SW1(config)# interface gi1/0/15
+SW1(config-if)# switchport mode access
+SW1(config-if)# switchport access vlan 99
+! ou : switchport access vlan name Guest
+```
+
+> Même configuré par **nom**, le VLAN est stocké en **numéro** dans la running-config.
+
+### 3.2 Trunk port
+
+- Transporte **plusieurs VLAN** sur un seul lien (switch ↔ switch, switch ↔ routeur/firewall, switch ↔ hyperviseur).
+- À la réception : lecture du tag → association au VLAN → **retrait du tag** → forwarding selon la table MAC de ce VLAN.
+
+```
+SW1(config-if)# switchport mode trunk
+```
+
+**`show interfaces trunk`** affiche 3 sections :
+1. les ports trunk, leur mode, l'encapsulation et le **native VLAN**
+2. les VLAN **autorisés** sur le trunk
+3. les VLAN autorisés **et** en état **STP forwarding** (les VLAN bloqués n'y figurent pas)
+
+### 3.3 Native VLAN
+
+- Tout trafic **non taggé** sur un trunk = **native VLAN**.
+- Par défaut : **VLAN 1**.
+- Configuration **par port** : `switchport trunk native vlan <id>`.
+- Doit être **identique des deux côtés** du trunk.
+- Bonne pratique sécurité : le mettre sur un **VLAN inutilisé** (aucun host), et pas sur le VLAN 1 (le control plane du switch passe par le VLAN 1).
+
+> Cas piège : un host en access VLAN 10 et un host branché sur un trunk avec native VLAN 10 peuvent communiquer, car aucun des deux n'a de tag. Ça marche, mais c'est une mauvaise pratique.
+
+### 3.4 Allowed VLANs
+
+Limiter les VLAN sur un trunk = moins de broadcast / flooding inutile, ou répartition de charge entre deux liens.
+
+```
+switchport trunk allowed vlan {liste | all | none | add <liste> | remove <liste> | except <liste>}
+```
+
+> ⚠️ **Piège n°1 en prod** : `switchport trunk allowed vlan 30` **remplace** toute la liste → coupure des autres VLAN. Pour ajouter : **`add`**. Pour retirer : **`remove`**.
+
+---
+
+## 4. Diagnostic L2
+
+### 4.1 Table MAC
+
+- Associe **MAC + VLAN → port**.
+- Construite en lisant la **MAC source** des trames reçues.
+- But : réduire le flooding d'unicast inconnu.
+
+```
+show mac address-table [address <mac> | dynamic | vlan <id>]
+```
+
+| Option | Utilité |
+|---|---|
+| `address` | chercher une MAC précise |
+| `dynamic` | seulement les entrées apprises dynamiquement |
+| `vlan` | filtrer par VLAN |
+
+- **Plusieurs MAC sur un même port** → derrière, il y a un switch, un hub ou un serveur avec vSwitch.
+- Entrée statique (ex. vieux load-balancers, pour éviter le flooding) :
+  `mac address-table static <mac> vlan <id> {interface <if> | drop}`
+- Vider la table :
+  `clear mac address-table dynamic [address <mac> | interface <if> | vlan <id>]`
+
+### 4.2 La CAM
+
+- La **table MAC est stockée dans la CAM** (Content Addressable Memory).
+- Mémoire ultra-rapide : on lui donne une **valeur**, elle répond directement **où** elle se trouve (pas de parcours ligne par ligne).
+- **Match exact, binaire**.
+- Les switches ont une grosse CAM pour stocker tous les hosts L2.
+
+> 🎯 Question du livre : « Quelle mémoire est directement corrélée à la table MAC ? » → **CAM**.
+
+### 4.3 `show interfaces <if> switchport`
+
+État L2 réel d'un port (utile car des commandes ailleurs dans la config peuvent écraser celle de l'interface). Champs à regarder :
+- **Switchport** : Enabled = port L2
+- **Administrative Mode** : ce qui est configuré (ex. dynamic auto)
+- **Operational Mode** : ce qui tourne réellement (access / trunk / down)
+- **Access Mode VLAN** et **Trunking Native Mode VLAN**
+
+### 4.4 `show interfaces status`
+
+Vue condensée de tous les ports :
+
+| Colonne | Signification |
+|---|---|
+| Port / Name | interface + description |
+| Status | `connected`, `notconnect`, `err-disabled` |
+| Vlan | n° de VLAN (access), `trunk`, ou `routed` (port L3) |
+| Duplex / Speed | préfixe `a-` = auto-négocié |
+| Type | `BaseTX` = cuivre RJ45, sinon modèle SFP (ou `unknown`) |
+
+---
+
+## 5. Forwarding L3
+
+L'émetteur décide d'abord en L3 (même réseau ou pas ?), **puis** construit l'en-tête L2.
+
+### 5.1 Même sous-réseau → ARP
+
+L'émetteur connaît sa MAC, mais pas celle de la destination.
+
+1. Il regarde sa **table ARP** (IP → MAC).
+2. Si absente → **ARP Request en broadcast** : « qui a l'IP X ? »
+3. Seul le propriétaire répond en **ARP Reply unicast**.
+4. L'émetteur met à jour sa table ARP et envoie le paquet.
+
+- La table ARP ne contient que des machines du **même segment**… **plus le next-hop** pour joindre les réseaux distants.
+- Les entrées expirent si inutilisées.
+- `show ip arp [mac | ip | vlan <id> | interface]`
+
+### 5.2 Sous-réseau différent → routage
+
+L'émetteur cherche un **next-hop** dans sa table de routage. Ce next-hop vient de :
+- une **route statique** (réseau + masque + next-hop),
+- une **default gateway** (route par défaut simplifiée),
+- un **protocole de routage**.
+
+Puis il fait un ARP… **sur l'IP du next-hop**, pas sur la destination finale.
+
+### 5.3 Réécriture L2 à chaque saut (à retenir !)
+
+À chaque routeur traversé :
+
+| Champ | Change ? |
+|---|---|
+| **IP source / IP destination** | ❌ **jamais** |
+| **MAC source** | ✅ devient la MAC de l'interface de sortie du routeur |
+| **MAC destination** | ✅ devient la MAC du next-hop (ou de la destination finale) |
+
+Exemple du livre : PC-A (192.168.1.1) → R1 → PC-B (192.168.2.2)
+
+```
+Avant R1 : MAC dst = R1 Gi0/0   | MAC src = PC-A    | IP 192.168.1.1 → 192.168.2.2
+Après R1 : MAC dst = PC-B       | MAC src = R1 Gi0/1 | IP 192.168.1.1 → 192.168.2.2
+```
+
+---
+
+## 6. Adressage IP des interfaces
+
+### 6.1 Interface routée classique
+
+```
+interface gi0/0/0
+ ip address 10.10.10.254 255.255.255.0
+ ip address 172.16.10.254 255.255.255.0 secondary
+ ipv6 address 2001:db8:10::254/64
+ ipv6 address 2001:db8:10:172::254/64
+```
+
+- Une interface **up** avec une IP injecte son réseau dans la **RIB** en **connected**.
+- Connected = **AD 0** → **impossible** à battre par une statique ou un protocole.
+- IPv4 : 2e adresse = mot-clé **`secondary`** obligatoire.
+- IPv6 : on répète simplement `ipv6 address` autant de fois que voulu.
+
+### 6.2 Sous-interfaces (router-on-a-stick)
+
+Quand il y a plusieurs VLAN à router mais pas assez de ports physiques : trunk côté switch, sous-interfaces côté routeur.
+
+```
+interface g0/0/1.10
+ encapsulation dot1Q 10
+ ip address 10.10.10.2 255.255.255.0
+```
+
+- Le n° de sous-interface **n'a pas besoin** d'égaler le VLAN (mais c'est plus lisible).
+- C'est `encapsulation dot1Q <vlan>` qui fait le lien avec le VLAN.
+
+### 6.3 SVI (interface VLAN)
+
+```
+interface vlan 10
+ ip address 10.10.10.1 255.255.255.0
+ no shutdown
+```
+
+- Sur switch multilayer : routage inter-VLAN **sans routeur externe**.
+- ⚠️ La SVI n'est **up** que si **au moins un port du VLAN est up** sur le switch.
+
+### 6.4 Routed switch port
+
+Lien L3 point-à-point entre switch et routeur, sans passer par un VLAN de transit (qui pourrait exister ailleurs ou être impacté par STP).
+
+```
+interface gi1/0/14
+ no switchport
+ ip address 10.20.20.1 255.255.255.0
+```
+
+### 6.5 Vérification
+
+```
+show ip interface brief | exclude unassigned
+show ipv6 interface brief | exclude unassigned|GigabitEthernet
+```
+
+`show ip interface` (sans brief) donne aussi MTU, relais DHCP, ACL appliquées, etc.
+
+---
+
+## 7. Architectures de forwarding
+
+### 7.1 Évolution
+
+Avant : le routeur **retirait** l'en-tête L2, cherchait la route, puis **rajoutait** un nouvel en-tête.
+Aujourd'hui : il **réécrit** simplement les champs → bien plus rapide.
+
+```
+Process switching  →  Fast switching  →  CEF
+(lent, CPU)                               (rapide, défaut aujourd'hui)
+```
+
+### 7.2 Process switching (slow path)
+
+- Le **CPU** généraliste fait tout, via le process **`ip_input`**.
+- Aujourd'hui c'est le **fallback de CEF** : il traite les paquets **punted** (renvoyés au CPU).
+
+Paquets qui partent au CPU :
+- trafic **à destination ou en provenance** du routeur (protocoles de routage, SSH…)
+- paquets **trop complexes** pour le hardware (ex. **IP options**)
+- paquets auxquels il **manque une info** (ex. **ARP non résolu**)
+
+Ce que fait `ip_input` : consulte RIB + table ARP → réécrit MAC dst (next-hop) et MAC src (interface de sortie) → **TTL −1** → recalcule le **checksum IP** → envoie.
+
+> Le software switching est **beaucoup plus lent** : il ne doit traiter qu'une infime partie du trafic.
+
+### 7.3 CEF (Cisco Express Forwarding)
+
+- Mécanisme **propriétaire Cisco**, **par défaut** sur quasiment toutes les plateformes.
+- **Software CEF** : sur les routeurs sans ASIC, le CPU fait le CEF.
+- **Hardware CEF** : sur les plateformes à ASIC / **TCAM** / **NPU**, ce sont les forwarding engines qui forwardent.
+
+### 7.4 CAM vs TCAM
+
+| | **CAM** | **TCAM** |
+|---|---|---|
+| Nom | Content Addressable Memory | **Ternary** CAM |
+| Valeurs par bit | 0 / 1 (binaire) | 0 / 1 / **X** (don't care) |
+| Match | **exact** | **avec masque**, sur **plusieurs champs** |
+| Stocke | **table MAC** | FIB (routes), **ACL**, **QoS**, PBR… |
+| Question posée | « cette MAC + VLAN → quel port ? » | « ce paquet matche quelle route / quelle règle ? » |
+
+**Format TCAM = VMR** :
+- **Value** : les champs à comparer (IP, protocole…)
+- **Mask** : quels bits comptent
+- **Result** : l'action (permit/deny, envoyer vers un policer QoS, **pointeur vers une entrée de forwarding**…)
+
+Points clés :
+- Plusieurs TCAM / zones → sécurité in/out, QoS, décision L2 et L3 **en même temps**.
+- Une ACL de **10 ou 500 lignes** est traitée **à la même vitesse**.
+- Ressource **limitée** → répartition entre fonctions = compromis (voir SDM).
+
+> Note du livre : il décrit la CAM comme renvoyant « 0 = vrai / 1 = faux » et la TCAM « 0 / 1 / X ». Retiens surtout : **CAM = binaire / exact**, **TCAM = ternaire / masque**.
+
+### 7.5 Centralisé vs distribué
+
+| | **Centralisé** | **Distribué** |
+|---|---|---|
+| Qui décide ? | le forwarding engine du **Route Processor (RP)** | chaque **line card** a son propre forwarding engine |
+| Trajet du paquet | line card in → **RP** → line card out | line card in → (fabric) → line card out, **sans passer par le RP** |
+| Avantage | simple, moins cher | **densité de ports** et **scalabilité** du forwarding |
+
+> 🎯 Question du livre : l'architecture qui augmente la densité de ports et la scalabilité → **distribuée**.
+
+### 7.6 Software CEF : FIB + Adjacency
+
+> 🎯 Question du livre : CEF est composé de → **FIB** + **Adjacency table**.
+
+| | **FIB** | **Adjacency table (AIB)** |
+|---|---|---|
+| Construite depuis | la **RIB** (table de routage) | la **table ARP** (ou autre protocole L2) |
+| Contient | préfixe → **next-hop** (pointeur vers adjacency) | next-hop → **MAC du next-hop**, **MAC de l'interface de sortie**, interface |
+| Rôle | décision L3 : « vers ce préfixe, par quel next-hop ? » | réécriture L2 : « quel en-tête Ethernet coller ? » |
+
+- La FIB est un **miroir** de la RIB : toute modif de la RIB est répercutée.
+- Les **routes récursives** sont résolues dans la FIB. Exemple du livre : statique `172.16.10.0/24` via `10.40.40.254`, lui-même joint via OSPF par `10.10.10.254` → la FIB pointe **directement** vers l'adjacency `10.10.10.254`.
+- Pour l'interface de sortie, l'adjacency **croise la MAC du next-hop avec la table MAC**.
+
+**Traitement d'un paquet par CEF :**
+1. Lookup dans la **FIB**.
+2. Pas d'entrée exploitable → **glean** → paquet envoyé au **CPU**.
+3. Entrée trouvée → lookup de l'**adjacency** associée.
+4. Adjacency absente → déclenche **ARP** ; une fois résolu, l'entrée CEF est complète.
+5. **Réécriture** : MAC dst = next-hop, MAC src = interface de sortie, **TTL −1**, **checksum recalculé**, envoi.
+
+- Les paquets punted au CPU (adjacency incomplète/invalide) sont **rate-limités** pour protéger le CPU.
+- **TTL** : −1 à chaque saut L3 ; un paquet reçu avec TTL **0** est **jeté** → anti-boucle L3.
+
+### 7.7 Hardware CEF
+
+- **ASIC** : très rapide mais **figé** (câblé pour une tâche), cher à concevoir.
+- **NPU** : **programmable** (firmware modifiable) → compense la rigidité des ASIC.
+- **dCEF (distributed CEF)** : les structures CEF sont **copiées** sur les ASIC/CPU de **chaque line card** → elles forwardent elles-mêmes.
+- Sur ces plateformes, le **software CEF ne forwarde pas** : il sert à **programmer le hardware**.
+
+```
+RIB (show ip route) → FIB logicielle (show ip cef) → FIB hardware (TCAM / ASIC)
+```
+
+### 7.8 SDM templates
+
+- La TCAM est **limitée** et **répartie au boot**.
+- Si une zone est pleine → débordement envoyé au **CPU** → grosse chute de perf.
+- Les **SDM templates** (Switching Database Manager) définissent la répartition entre MAC, routes, ACL, QoS, PBR, etc.
+
+```
+SW1(config)# sdm prefer {vlan | advanced}
+SW1# reload            ← obligatoire
+SW1# show sdm prefer
+```
+
+- Tous les membres d'un **stack** doivent avoir le **même** template.
+- **IPv6** consomme **2× plus** d'entrées → moitié moins de capacité.
+- Exemple de différence (Cat9300) : le template **vlan** met **0** entrée **PBR** et **0** **microflow policer**, alors qu'**advanced** en a.
+
+---
+
+## 8. Synthèse : un paquet traverse un switch L3
+
+Paquet de 192.168.20.10 (VLAN 20, Gi1/0/1) vers 172.16.5.5 :
+
+```
+1. CAM       : apprend MAC source  → VLAN 20 + MAC PC → Gi1/0/1
+2. Décision  : MAC dst = MAC de la SVI Vlan20 → il faut ROUTER
+3. TCAM      : en parallèle
+               ├─ ACL  → permit / deny
+               ├─ QoS  → classe / marquage
+               └─ FIB  → longest prefix match 172.16.0.0/16 → pointeur adjacency
+4. Adjacency : MAC dst next-hop, MAC src SVI Vlan10, TTL−1, checksum
+5. CAM       : VLAN 10 + MAC next-hop → Gi1/0/5   (inconnue → flood dans le VLAN)
+6. TCAM      : ACL/QoS en sortie si configurées → envoi
+```
+
+Si le paquet reste **dans le même VLAN** : seulement l'étape 1 + lookup CAM de la MAC destination (+ TCAM si ACL/QoS).
+
+**Qui fait quoi :**
+- **CAM** = « où est cette machine ? » (port)
+- **TCAM** = « que faire de ce paquet et vers où ? » (route, ACL, QoS)
+- **Adjacency** = « quel en-tête L2 je mets ? » (fait le lien L3 → L2)
+
+---
+
+## 9. Pièges d'examen
+
+- Switch = réduit **collision** ; routeur = réduit **broadcast**.
+- L2 forwarding = **MAC destination** ; L3 forwarding = **IP destination**.
+- La table MAC apprend via la **MAC source**.
+- **Table MAC ↔ CAM** (pas la TCAM, pas l'adjacency).
+- **CEF = FIB + Adjacency** (pas la RIB, pas la table MAC).
+- Tag 802.1Q = **32 bits** ; VLAN ID = **12 bits** ; TPID = **0x8100** ; PCP = **CoS 3 bits**.
+- VLAN 1002-1005 **non supprimables**.
+- Native VLAN par défaut = **1**, doit **matcher** des deux côtés.
+- `allowed vlan` sans `add` = **écrase** la liste.
+- Connected = **AD 0**.
+- IPv4 2e adresse = **`secondary`** ; IPv6 = commandes multiples.
+- SVI up = au moins **1 port du VLAN up**.
+- Format TCAM = **VMR** (Value, Mask, Result).
+- Changement SDM = **reload** obligatoire ; IPv6 = **2× les entrées**.
+- IP options / ARP non résolu / trafic vers le routeur → **process switching**.
+- Distribué = **densité de ports + scalabilité**.
+
+---
+
+## 10. Aide-mémoire des commandes
+
+| Tâche | Commande |
+|---|---|
+| Créer / nommer un VLAN | `vlan <id>` / `name <nom>` |
+| Port access | `switchport mode access` + `switchport access vlan {id \| name <nom>}` |
+| Port trunk | `switchport mode trunk` |
+| Native VLAN | `switchport trunk native vlan <id>` |
+| VLAN autorisés | `switchport trunk allowed vlan {liste \| add \| remove \| except \| all \| none}` |
+| MAC statique | `mac address-table static <mac> vlan <id> interface <if>` |
+| Vider la table MAC | `clear mac address-table dynamic [...]` |
+| IPv4 / secondaire | `ip address <ip> <masque> [secondary]` |
+| IPv6 | `ipv6 address <ipv6>/<prefix>` |
+| Sous-interface | `interface g0/0/1.10` + `encapsulation dot1Q 10` |
+| SVI | `interface vlan <id>` |
+| Port routé | `no switchport` |
+| Template SDM | `sdm prefer {vlan \| advanced}` + `reload` |
+| Voir les VLAN | `show vlan [brief \| id \| name \| summary]` |
+| Voir les trunks | `show interfaces trunk` |
+| Table MAC | `show mac address-table [address \| dynamic \| vlan]` |
+| État d'un port L2 | `show interfaces <if> switchport` |
+| État de tous les ports | `show interfaces status` |
+| Table ARP | `show ip arp [...]` |
+| IP des interfaces | `show ip interface brief` / `show ipv6 interface brief` |
+| Template SDM actif | `show sdm prefer` |
+| RIB / FIB / adjacency | `show ip route` / `show ip cef` / `show adjacency detail` |
+
+---
+
+## 11. Auto-test rapide
+
+1. Quel champ un switch utilise-t-il pour forwarder ? Et pour apprendre ?
+2. Quel équipement réduit le domaine de broadcast ?
+3. Dans quelle mémoire est stockée la table MAC ?
+4. Quels sont les 2 composants de CEF ?
+5. Que signifie VMR ?
+6. Pourquoi `switchport trunk allowed vlan 30` peut provoquer une coupure ?
+7. Quels champs changent quand un paquet traverse un routeur ?
+8. Citer 3 types de paquets traités en process switching.
+9. Que faut-il faire après `sdm prefer advanced` ?
+10. Quelle architecture améliore la densité de ports ?
+
+<details>
+<summary>Réponses</summary>
+
+1. MAC **destination** pour forwarder, MAC **source** pour apprendre.
+2. Le **routeur**.
+3. La **CAM**.
+4. **FIB** + **Adjacency table**.
+5. **Value, Mask, Result** (format des entrées TCAM).
+6. Elle **remplace** la liste existante → les autres VLAN sont retirés du trunk.
+7. **MAC source** et **MAC destination** (+ TTL et checksum). Les IP ne changent pas.
+8. Trafic vers/depuis le routeur, paquets avec **IP options**, **ARP non résolu**.
+9. Un **reload**.
+10. L'architecture **distribuée**.
+
+</details>
